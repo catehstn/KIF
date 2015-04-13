@@ -124,6 +124,48 @@
     }];
 }
 
+- (void)waitForAnimationsToFinish {
+    [self waitForAnimationsToFinishWithTimeout:self.animationWaitingTimeout];
+}
+
+- (void)waitForAnimationsToFinishWithTimeout:(NSTimeInterval)timeout {
+    static const CGFloat kStabilizationWait = 0.5f;
+    
+    NSTimeInterval maximumWaitingTimeInterval = timeout;
+    if (maximumWaitingTimeInterval <= kStabilizationWait) {
+        if(maximumWaitingTimeInterval >= 0) {
+            [self waitForTimeInterval:maximumWaitingTimeInterval];
+        }
+        
+        return;
+    }
+    
+    // Wait for the view to stabilize and give them a chance to start animations before we wait for them.
+    [self waitForTimeInterval:kStabilizationWait];
+    maximumWaitingTimeInterval -= kStabilizationWait;
+    
+    NSTimeInterval startTime = [NSDate timeIntervalSinceReferenceDate];
+    [self runBlock:^KIFTestStepResult(NSError **error) {
+        __block BOOL runningAnimationFound = false;
+        for (UIWindow *window in [UIApplication sharedApplication].windowsWithKeyWindow) {
+            [window performBlockOnDescendentViews:^(UIView *view, BOOL *stop) {
+                BOOL isViewVisible = [view isVisibleInViewHierarchy];   // do not wait for animatinos of views that aren't visible
+                BOOL hasAnimation = view.layer.animationKeys.count != 0 && ![view.layer.animationKeys isEqualToArray:@[@"_UIParallaxMotionEffect"]];    // explicitly exclude _UIParallaxMotionEffect as it is used in alertviews, and we don't want every alertview to be paused
+                BOOL hasUnfinishedSystemAnimation = [NSStringFromClass(view.class) isEqualToString:@"_UIParallaxDimmingView"];  // indicates that the view-hierarchy is in an in-between-state of an animation
+                if (isViewVisible && (hasAnimation || hasUnfinishedSystemAnimation)) {
+                    runningAnimationFound = YES;
+                    if (stop != NULL) {
+                        *stop = YES;
+                    }
+                    return;
+                }
+            }];
+        }
+        
+        return runningAnimationFound && ([NSDate timeIntervalSinceReferenceDate] - startTime) < maximumWaitingTimeInterval ? KIFTestStepResultWait : KIFTestStepResultSuccess;
+    } timeout:maximumWaitingTimeInterval + 1];
+}
+
 - (void)tapViewWithAccessibilityLabel:(NSString *)label
 {
     [self tapViewWithAccessibilityLabel:label value:nil traits:UIAccessibilityTraitNone];
@@ -168,9 +210,6 @@
         
         return KIFTestStepResultSuccess;
     }];
-    
-    // Wait for the view to stabilize.
-    [self waitForTimeInterval:0.5];
 
     [self waitForAnimationsToFinish];
 }
@@ -353,7 +392,13 @@
     } timeout:1.0];
 }
 
-
+- (void)clearTextFromFirstResponder
+{
+    UIView *firstResponder = (id)[[[UIApplication sharedApplication] keyWindow] firstResponder];
+    if ([firstResponder isKindOfClass:[UIView class]]) {
+        [self clearTextFromElement:(UIAccessibilityElement *)firstResponder inView:firstResponder];
+    }
+}
 
 - (void)clearTextFromViewWithAccessibilityLabel:(NSString *)label
 {
@@ -371,27 +416,25 @@
 
 - (void)clearTextFromElement:(UIAccessibilityElement*)element inView:(UIView*)view
 {
-	NSUInteger numberOfCharacters = [view respondsToSelector:@selector(text)] ? [(UITextField *)view text].length : element.accessibilityValue.length;
-	
-	[self tapAccessibilityElement:element inView:view];
-	
-	// Per issue #294, the tap occurs in the center of the text view.  If the text is too long, this means not all text gets cleared.  To address this for most cases, we can check if the selected view conforms to UITextInput and select the whole text range.
-	if ([view conformsToProtocol:@protocol(UITextInput)]) {
-		id <UITextInput> textInput = (id <UITextInput>)view;
-		[textInput setSelectedTextRange:[textInput textRangeFromPosition:textInput.beginningOfDocument toPosition:textInput.endOfDocument]];
-		
-		[self waitForTimeInterval:0.1];
-		[self enterTextIntoCurrentFirstResponder:@"\b" fallbackView:view];
-	} else {
-		
-		NSMutableString *text = [NSMutableString string];
-		for (NSInteger i = 0; i < numberOfCharacters; i ++) {
-			[text appendString:@"\b"];
-		}
-		[self enterTextIntoCurrentFirstResponder:text fallbackView:view];
-	}
-	
-	[self expectView:view toContainText:@""];
+    [self tapAccessibilityElement:element inView:view];
+
+    // Per issue #294, the tap occurs in the center of the text view.  If the text is too long, this means not all text gets cleared.  To address this for most cases, we can check if the selected view conforms to UITextInput and select the whole text range.
+    if ([view conformsToProtocol:@protocol(UITextInput)]) {
+        id <UITextInput> textInput = (id <UITextInput>)view;
+        [textInput setSelectedTextRange:[textInput textRangeFromPosition:textInput.beginningOfDocument toPosition:textInput.endOfDocument]];
+        
+        [self waitForTimeInterval:0.1];
+        [self enterTextIntoCurrentFirstResponder:@"\b" fallbackView:view];
+    } else {
+        NSUInteger numberOfCharacters = [view respondsToSelector:@selector(text)] ? [(UITextField *)view text].length : element.accessibilityValue.length;
+        NSMutableString *text = [NSMutableString string];
+        for (NSInteger i = 0; i < numberOfCharacters; i ++) {
+            [text appendString:@"\b"];
+        }
+        [self enterTextIntoCurrentFirstResponder:text fallbackView:view];
+    }
+    
+    [self expectView:view toContainText:@""];
 }
 
 - (void)clearTextFromAndThenEnterText:(NSString *)text intoViewWithAccessibilityLabel:(NSString *)label
@@ -404,6 +447,12 @@
 {
     [self clearTextFromViewWithAccessibilityLabel:label traits:traits];
     [self enterText:text intoViewWithAccessibilityLabel:label traits:traits expectedResult:expectedResult];
+}
+
+- (void)clearTextFromAndThenEnterTextIntoCurrentFirstResponder:(NSString *)text
+{
+    [self clearTextFromFirstResponder];
+    [self enterTextIntoCurrentFirstResponder:text];
 }
 
 - (void) selectDatePickerValue:(NSArray*)datePickerColumnValues {
@@ -440,7 +489,23 @@
             [dataToSelect addObject:title];
         }
         else {
-            [dataToSelect addObject:@""];
+            NSInteger currentIndex = [pickerView selectedRowInComponent:i];
+            NSString *rowTitle = nil;
+            if ([pickerView.delegate respondsToSelector:@selector(pickerView:titleForRow:forComponent:)]) {
+                rowTitle = [pickerView.delegate pickerView:pickerView titleForRow:currentIndex forComponent: i];
+            } else if ([pickerView.delegate respondsToSelector:@selector(pickerView:viewForRow:forComponent:reusingView:)]) {
+                // This delegate inserts views directly, so try to figure out what the title is by looking for a label
+                UIView *rowView = [pickerView.delegate pickerView:pickerView viewForRow:currentIndex forComponent: i reusingView:nil];
+                NSArray *labels = [rowView subviewsWithClassNameOrSuperClassNamePrefix:@"UILabel"];
+                UILabel *label = (labels.count > 0 ? labels[0] : nil);
+                rowTitle = label.text;
+            }
+            
+            if (rowTitle) {
+                [dataToSelect addObject: rowTitle];
+            } else {
+                @throw [NSException exceptionWithName:NSInternalInconsistencyException reason:@"Unknown picker type. Delegate responds neither to pickerView:titleForRow:forComponent: nor to pickerView:viewForRow:forComponent:reusingView:" userInfo:nil];
+            }
         }
     }
     
@@ -477,14 +542,24 @@
                 if ([pickerView.delegate respondsToSelector:@selector(pickerView:titleForRow:forComponent:)]) {
                     rowTitle = [pickerView.delegate pickerView:pickerView titleForRow:rowIndex forComponent:componentIndex];
                 } else if ([pickerView.delegate respondsToSelector:@selector(pickerView:viewForRow:forComponent:reusingView:)]) {
-                    // This delegate inserts views directly, so try to figure out what the title is by looking for a label
+                    
                     UIView *rowView = [pickerView.delegate pickerView:pickerView viewForRow:rowIndex forComponent:componentIndex reusingView:nil];
-                    NSArray *labels = [rowView subviewsWithClassNameOrSuperClassNamePrefix:@"UILabel"];
-                    UILabel *label = (labels.count > 0 ? labels[0] : nil);
+                    UILabel *label;
+                    if ([rowView isKindOfClass:[UILabel class]] ) {
+                        label = (id)rowView;
+                    } else {
+                        // This delegate inserts views directly, so try to figure out what the title is by looking for a label
+                        NSArray *labels = [rowView subviewsWithClassNameOrSuperClassNamePrefix:@"UILabel"];
+                        label = (labels.count > 0 ? labels[0] : nil);
+                    }
                     rowTitle = label.text;
                 }
                 
-                if ([rowTitle isEqual:pickerColumnValues[componentIndex]]) {
+                if (rowIndex==[pickerView selectedRowInComponent:componentIndex] && [rowTitle isEqual:pickerColumnValues[componentIndex]]){
+                    [found_values replaceObjectAtIndex:componentIndex withObject:@(YES)];
+                    break;
+                }
+                else if ([rowTitle isEqual:pickerColumnValues[componentIndex]]) {
                     [pickerView selectRow:rowIndex inComponent:componentIndex animated:false];
                     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1, false);
                     
@@ -674,9 +749,6 @@
     CGRect cellFrame = [cell.contentView convertRect:cell.contentView.frame toView:tableView];
     [tableView tapAtPoint:CGPointCenteredInRect(cellFrame)];
     
-    // Wait for the view to stabilize.
-    [tester waitForTimeInterval:0.5];
-
     [self waitForAnimationsToFinish];
 }
 
@@ -699,9 +771,6 @@
     CGRect cellFrame = [cell.contentView convertRect:cell.contentView.frame toView:collectionView];
     [collectionView tapAtPoint:CGPointCenteredInRect(cellFrame)];
     
-    // Wait for the view to stabilize.
-    [tester waitForTimeInterval:0.5];
-
     [self waitForAnimationsToFinish];
 }
 
@@ -891,9 +960,20 @@
     [collectionView scrollToItemAtIndexPath:indexPath
                            atScrollPosition:UICollectionViewScrollPositionCenteredHorizontally | UICollectionViewScrollPositionCenteredVertically
                                    animated:YES];
-    [self waitForTimeInterval:0.5];
+
+    [self waitForAnimationsToFinish];
     UICollectionViewCell *cell = [collectionView cellForItemAtIndexPath:indexPath];
 
+    //For big collection views with many cells the cell might not be ready yet. Relayout and try again.
+    if(cell == nil) {
+        [collectionView layoutIfNeeded];
+        [collectionView scrollToItemAtIndexPath:indexPath
+                               atScrollPosition:UICollectionViewScrollPositionCenteredHorizontally | UICollectionViewScrollPositionCenteredVertically
+                                       animated:YES];
+        [self waitForAnimationsToFinish];
+        cell = [collectionView cellForItemAtIndexPath:indexPath];
+    }
+    
     if (!cell) {
         [self failWithError:[NSError KIFErrorWithFormat: @"Collection view cell at index path %@ not found", indexPath] stopTest:YES];
     }
